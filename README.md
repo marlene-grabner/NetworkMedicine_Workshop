@@ -2,7 +2,7 @@
 
 Integrating spatial transcriptomics, proteomics, and metabolomics via network medicine.
 
-## For attendees — zero setup
+## For attendees
 
 You need **a free Google account and a browser**. Nothing to install, nothing to upload.
 
