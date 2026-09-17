@@ -3,7 +3,10 @@ Helper functions for 02_overlay_enrichment.ipynb.
 
 This file holds the plotting/layout mechanics behind the "module overview" figure — none of it
 is specific to network medicine, it's just the bookkeeping needed to draw a module as a tight,
-localized cluster with its network context pushed out around it. It's pulled out here so the
+localized cluster with its network context pushed out around it — plus one small piece of
+plumbing for the enrichment step: a cache lookup so the four g:Profiler calls this notebook makes
+by default are precomputed (same synthetic data for every workshop run) rather than live, so 30+
+people running this at once don't all hit g:Profiler simultaneously. It's pulled out here so the
 notebook itself can stay focused on the actual analysis. Nothing stops you from opening this
 file and reading it if you're curious how the figure is built — it's plain Python.
 """
@@ -11,8 +14,21 @@ file and reading it if you're curious how the figure is built — it's plain Pyt
 import os
 
 import numpy as np
+import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+
+
+def load_cached_enrichment(lookups_dir, cache_key):
+    """A precomputed g:Profiler enrichment table for one of this notebook's four default
+    queries (see lookups/enrichment_<cache_key>.csv, built once from the workshop's own
+    synthetic data). Returns None if that file isn't there, so the caller can fall back to a
+    live g:Profiler call -- e.g. if you've swapped in your own DE lists."""
+    path = os.path.join(lookups_dir, f"enrichment_{cache_key}.csv")
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path)
+
 
 # dark = module (largest connected component), light = real network neighbors shown for context
 LAYER_COLORS = {

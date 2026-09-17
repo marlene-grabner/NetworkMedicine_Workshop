@@ -1,19 +1,22 @@
 """
 Helper functions for 03_bridging.ipynb.
 
-Four kinds of thing live here, none of them the actual network-medicine lesson: the graph-
-algorithm mechanics behind the prize-collecting bridge module (the degree-penalized cost graph,
-turning terminals into a minimum-cost Steiner tree, and the prize-collecting pruning that decides
-which of them were worth it — standard graph-theory machinery, not something specific to this
-analysis), the degree-matched null-model permutation loop that validates the resulting module,
-the drawing mechanics behind the final figure (tiers, bands, labels, legend), and the raw API
-plumbing for two data sources the notebook uses along the way — a live per-compound KEGG fallback
-(only used if the pre-built bridge file is missing) and the Open Targets GraphQL calls. The
-notebook itself keeps the actual *decisions* — prizes, costs, how strict the pruning is, how many
-hops the figure shows — as tunable parameters up top. Nothing stops you from opening this file
-and reading it if you're curious how any of it works.
+Four kinds of thing live here, none of them the actual network-medicine lesson: loading the
+precomputed lookups this notebook reads by default (a gene ID<->symbol table, cached Open Targets
+results) — plus the *live* Open Targets calls those lookups stand in for, kept available for
+anyone who points this at their own disease of interest; the graph-algorithm mechanics behind the
+prize-collecting bridge module (the degree-penalized cost graph, turning terminals into a
+minimum-cost Steiner tree, and the prize-collecting pruning that decides which of them were worth
+it — standard graph-theory machinery, not something specific to this analysis); the degree-matched
+null-model permutation loop that validates the resulting module; and the drawing mechanics behind
+the final figure (tiers, bands, labels, legend). The notebook itself keeps the actual *decisions*
+— prizes, costs, how strict the pruning is, how many hops the figure shows — as tunable parameters
+up top. Nothing stops you from opening this file and reading it if you're curious how any of it
+works.
 """
 
+import json
+import os
 import time
 
 import numpy as np
@@ -27,40 +30,42 @@ from scipy.sparse.csgraph import dijkstra
 OT_API = "https://api.platform.opentargets.org/api/v4/graphql"
 
 
-def kegg_link(source_db, target_id):
-    """One call to KEGG's `link` endpoint, e.g. all enzymes (EC numbers) linked to a compound,
-    or all human genes linked to an EC number."""
-    url = f"https://rest.kegg.jp/link/{source_db}/{target_id}"
-    r = requests.get(url, timeout=30)
-    if r.status_code != 200 or not r.text.strip():
-        return []
-    pairs = [line.split("\t") for line in r.text.strip().split("\n")]
-    return [p[1] for p in pairs if len(p) == 2]
+def load_gene_symbol_lookup(lookups_dir):
+    """Precomputed NCBI Gene ID -> symbol table, covering every node in the PPI network (built
+    once via mygene.info). Used to label connector genes without a live lookup per gene. Returns
+    an empty dict if the file isn't there, in which case labels just fall back to the raw ID."""
+    path = os.path.join(lookups_dir, "ppi_gene_id_symbol_lookup.csv")
+    if not os.path.exists(path):
+        return {}
+    import pandas as pd
+    df = pd.read_csv(path, dtype=str)
+    return dict(zip(df["ncbi_gene_id"], df["symbol"]))
 
 
-def genes_for_compound(cid):
-    """compound -> enzymes (EC numbers) that act on it -> human genes encoding those enzymes."""
-    genes = set()
-    try:
-        for ec in kegg_link("enzyme", f"cpd:{cid}"):
-            for g in kegg_link("hsa", ec):
-                genes.add(g.replace("hsa:", ""))
-    except Exception as e:
-        print(f"  [warn] {cid}: {e}")
-    return genes
+def load_cached_enrichment(lookups_dir, cache_key):
+    """A precomputed g:Profiler enrichment table for one of this notebook's two default queries
+    (see lookups/<cache_key>.csv, built once from the workshop's own synthetic data). Returns
+    None if that file isn't there, so the caller can fall back to a live g:Profiler call."""
+    path = os.path.join(lookups_dir, f"{cache_key}.csv")
+    if not os.path.exists(path):
+        return None
+    import pandas as pd
+    return pd.read_csv(path)
 
 
-def build_bridge_live(metab_ids):
-    """The slow path: one live KEGG query per compound instead of the pre-built bridge file.
-    Only used as a fallback if `metabolite_gene_bridge.csv` isn't available."""
-    t0 = time.time()
-    bridge_cache = {}
-    for i, cid in enumerate(metab_ids):
-        bridge_cache[cid] = genes_for_compound(cid)
-        if (i + 1) % 25 == 0:
-            print(f"  ...{i + 1}/{len(metab_ids)}  ({time.time() - t0:.0f}s elapsed)")
-    print(f"Done in {time.time() - t0:.0f}s")
-    return bridge_cache
+def load_cached_disease(lookups_dir, disease_name):
+    """A precomputed Open Targets result (search hits, EFO ID, associated gene symbols) for one
+    of the three disease queries this workshop runs by default -- see
+    lookups/opentargets_diseases.json. `disease_name` is matched exactly against the query string
+    used when the lookup was built (e.g. "chronic kidney disease"). Returns None if the file or
+    that exact query isn't cached, so the caller can fall back to a live search_disease() /
+    fetch_disease_targets() call -- e.g. if you've changed DISEASE_QUERY to your own phenotype."""
+    path = os.path.join(lookups_dir, "opentargets_diseases.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        all_diseases = json.load(f)
+    return all_diseases.get(disease_name)
 
 
 def search_disease(query, size=5):
@@ -434,7 +439,7 @@ def plot_layered_bridge(
 
 
 def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, metab_terminal_gene,
-                           metabs_matched, id_to_symbol, sym_lookup, mg,
+                           metabs_matched, id_to_symbol, sym_lookup,
                            max_hop_cap=3, explosion_threshold=70, save_path=None):
     """Everything Step 6 needs beyond its two tunable parameters: hop-tier the connector genes by
     distance from the protein module within the bridge tree, cap the figure's depth if that would
@@ -481,13 +486,9 @@ def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, m
 
     kegg_to_name = dict(zip(metabs_matched["kegg_id"], metabs_matched["matched_name"]))
     gene_label_lookup = {**id_to_symbol, **sym_lookup}
-    unresolved = [n for n in visible_nodes if n not in gene_label_lookup]
-    if unresolved:
-        extra = mg.querymany(unresolved, scopes="entrezgene", fields="symbol", species="human", returnall=True)
-        for hit in extra["out"]:
-            if "symbol" in hit:
-                gene_label_lookup[hit["query"]] = hit["symbol"]
-
+    # any node still unresolved here just displays as its raw NCBI Gene ID -- id_to_symbol and
+    # sym_lookup already draw on the full precomputed PPI gene-symbol table, so there's nothing
+    # left worth a live lookup for.
     labels = {cid: kegg_to_name.get(cid, cid) for cid in top_nodes}
     labels.update({n: gene_label_lookup.get(n, n) for n in visible_nodes})
 
