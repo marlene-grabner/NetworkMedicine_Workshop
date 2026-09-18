@@ -16,7 +16,7 @@ If you want to keep an edited copy of a notebook, `File → Save a copy in Drive
 | Notebook | Opens in Colab |
 |---|---|
 | 01 — Matching & Loading | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marlene-grabner/NetworkMedicine_Workshop/blob/main/01_matching_and_loading.ipynb) |
-| 02 — Overlay & Enrichment | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marlene-grabner/NetworkMedicine_Workshop/blob/main/02_overlay_enrichment.ipynb) |
+| 02 — Network Overlay & Enrichment | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marlene-grabner/NetworkMedicine_Workshop/blob/main/02_network_overlay_enrichment.ipynb) |
 | 03 — Bridging | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marlene-grabner/NetworkMedicine_Workshop/blob/main/03_bridging.ipynb) |
 | 04 — Disease Modules (optional) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marlene-grabner/NetworkMedicine_Workshop/blob/main/04_disease_modules_optional.ipynb) |
 
