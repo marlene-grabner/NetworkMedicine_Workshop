@@ -4,15 +4,15 @@ Helper functions for 03_bridging.ipynb.
 Four kinds of thing live here, none of them the actual network-medicine lesson: loading the
 precomputed lookups this notebook reads by default (a gene ID<->symbol table, cached Open Targets
 results) — plus the *live* Open Targets calls those lookups stand in for, kept available for
-anyone who points this at their own disease of interest; the graph-algorithm mechanics behind the
-prize-collecting bridge module (the degree-penalized cost graph, turning terminals into a
-minimum-cost Steiner tree, and the prize-collecting pruning that decides which of them were worth
-it — standard graph-theory machinery, not something specific to this analysis); the degree-matched
-null-model permutation loop that validates the resulting module; and the drawing mechanics behind
-the final figure (tiers, bands, labels, legend). The notebook itself keeps the actual *decisions*
-— prizes, costs, how strict the pruning is, how many hops the figure shows — as tunable parameters
-up top. Nothing stops you from opening this file and reading it if you're curious how any of it
-works.
+anyone who points this at their own disease of interest; the graph-building mechanics behind the
+prize-collecting bridge module (the degree-penalized cost graph, connecting up the anchor genes as
+cheaply as possible, and the prize-collecting pruning that decides which branches were worth
+keeping — standard graph-theory bookkeeping, not something specific to this analysis); the
+degree-matched null-model permutation loop that validates the resulting module; and the drawing
+mechanics behind the final figure (tiers, bands, labels, legend). The notebook itself keeps the
+actual *decisions* — prizes, costs, how strict the pruning is, how many hops the figure shows —
+as tunable parameters up top. Nothing stops you from opening this file and reading it if you're
+curious how any of it works.
 """
 
 import json
@@ -117,10 +117,11 @@ def fetch_disease_targets(efo_id, size=500):
 
 
 def build_cost_graph(G):
-    """Turn G into a sparse adjacency matrix weighted by a degree-penalized edge cost —
-    sqrt(deg(u) * deg(v)), normalized so the network's median edge costs about 1 — so a shortest
-    "cheapest path" through it prefers specific, low-degree interactions over generic hub
-    proteins. Returns (nodes, node_idx, A, degrees) for use with terminal_steiner_tree."""
+    """Turn G into a weighted graph where each edge's cost is sqrt(deg(u) * deg(v)) — how
+    connected its two endpoints already are — normalized so a typical edge costs about 1. A
+    "cheapest path" through this weighted version of the network prefers specific, less-generic
+    interactions over routes through promiscuous hub proteins. Returns (nodes, node_idx, A,
+    degrees) for use with connect_anchor_genes."""
     degrees = dict(G.degree())
     nodes = list(G.nodes())
     node_idx = {n: i for i, n in enumerate(nodes)}
@@ -139,31 +140,31 @@ def build_cost_graph(G):
     return nodes, node_idx, A, degrees
 
 
-def terminal_steiner_tree(nodes, node_idx, A, terminals):
-    """The minimum-cost tree connecting every node in `terminals` through the graph behind A:
-    compute cost-shortest paths between every pair of terminals, take the minimum spanning tree
-    of that terminal-to-terminal distance matrix, then stitch each MST edge back into the real
-    shortest path it stands for. This is the standard "MST of the metric closure" 2-approximation
-    to a Steiner tree — it forces every terminal in, with no judgment yet about whether a given
-    terminal was worth including (that's the prize-collecting step, back in the notebook).
+def connect_anchor_genes(nodes, node_idx, A, anchor_genes):
+    """The cheapest possible tree connecting every gene in `anchor_genes` through the (weighted)
+    network behind A: work out the cheapest path between every pair of anchor genes, keep only
+    the connections needed to link them all together as cheaply as possible (dropping any
+    redundant, more expensive ones), then stitch each of those back into the real path of genes
+    it stands for. This forces every anchor gene in, with no judgment yet about whether a given
+    one was actually worth including (that's the prize-collecting step, back in the notebook).
     Returns an nx.Graph with each edge's cost stored as edge attribute "cost"."""
-    term_idx = [node_idx[t] for t in terminals]
+    anchor_idx = [node_idx[t] for t in anchor_genes]
     dist_matrix, predecessors = dijkstra(
-        csgraph=A, directed=False, indices=term_idx, return_predecessors=True
+        csgraph=A, directed=False, indices=anchor_idx, return_predecessors=True
     )
-    D = dist_matrix[:, term_idx]
+    D = dist_matrix[:, anchor_idx]
 
-    term_graph = nx.Graph()
-    term_graph.add_nodes_from(terminals)
-    for i in range(len(terminals)):
-        for j in range(i + 1, len(terminals)):
+    anchor_graph = nx.Graph()
+    anchor_graph.add_nodes_from(anchor_genes)
+    for i in range(len(anchor_genes)):
+        for j in range(i + 1, len(anchor_genes)):
             if np.isfinite(D[i, j]):
-                term_graph.add_edge(terminals[i], terminals[j], weight=D[i, j])
-    mst = nx.minimum_spanning_tree(term_graph, weight="weight")
+                anchor_graph.add_edge(anchor_genes[i], anchor_genes[j], weight=D[i, j])
+    cheapest_links = nx.minimum_spanning_tree(anchor_graph, weight="weight")
 
     tree = nx.Graph()
-    for u, v in mst.edges():
-        src_row = term_idx.index(node_idx[u])
+    for u, v in cheapest_links.edges():
+        src_row = anchor_idx.index(node_idx[u])
         path = [node_idx[v]]
         cur = node_idx[v]
         while predecessors[src_row, cur] != -9999:
@@ -176,28 +177,28 @@ def terminal_steiner_tree(nodes, node_idx, A, terminals):
     return tree
 
 
-def select_metabolite_terminals(cost_nodes, cost_idx, A_cost, protein_terminals, metab_to_genes):
-    """One terminal gene per metabolite: whichever of its candidate bridging genes is cheapest to
+def select_metabolite_anchors(cost_nodes, cost_idx, A_cost, protein_anchors, metab_to_genes):
+    """One anchor gene per metabolite: whichever of its candidate bridging genes is cheapest to
     reach from the protein module — lowest degree-penalized cost, not just fewest hops.
-    Returns (metab_terminal_gene, metab_terminals): a {kegg_id: gene} map, and the set of its
+    Returns (metab_anchor_gene, metab_anchors): a {kegg_id: gene} map, and the set of its
     (deduplicated) values."""
     dist_from_module = dijkstra(
         csgraph=A_cost, directed=False,
-        indices=[cost_idx[n] for n in protein_terminals], min_only=True,
+        indices=[cost_idx[n] for n in protein_anchors], min_only=True,
     )
-    metab_terminal_gene = {
+    metab_anchor_gene = {
         cid: min(genes_here, key=lambda g: dist_from_module[cost_idx[g]])
         for cid, genes_here in metab_to_genes.items()
     }
-    return metab_terminal_gene, set(metab_terminal_gene.values())
+    return metab_anchor_gene, set(metab_anchor_gene.values())
 
 
-def _prune_module(tree, terminal_set, prize, strictness):
+def _prune_module(tree, anchor_genes, prize, strictness):
     """The prize-collecting step: repeatedly trim dangling branch tips that aren't worth their
-    cost. A non-terminal (Steiner) leaf is always dangling — it exists only to connect something
-    else, so once it's down to degree 1 it's connecting nothing and gets cut. A terminal leaf is
-    only cut if the single edge holding it to the tree costs more than its own prize (times
-    `strictness`) — i.e. we'd rather drop it than pay that much just to include it."""
+    cost. A non-anchor leaf is always dangling — it only exists to connect something else, so
+    once it's down to a single connection it's connecting nothing and gets cut. An anchor-gene
+    leaf is only cut if the single connection holding it to the tree costs more than its own
+    prize (times `strictness`) — i.e. we'd rather drop it than pay that much just to include it."""
     tree = tree.copy()
     changed = True
     while changed:
@@ -207,19 +208,19 @@ def _prune_module(tree, terminal_set, prize, strictness):
                 break
             nbr = next(iter(tree.neighbors(leaf)))
             edge_cost = tree.edges[leaf, nbr]["cost"]
-            if leaf not in terminal_set or edge_cost > prize.get(leaf, 0) * strictness:
+            if leaf not in anchor_genes or edge_cost > prize.get(leaf, 0) * strictness:
                 tree.remove_node(leaf)
                 changed = True
     return tree
 
 
-def build_bridge_module(cost_nodes, cost_idx, A_cost, protein_terms, metab_terms, prize, strictness=1.0):
-    """Force every terminal in via a minimum-cost Steiner tree, then prune away the branches that
-    weren't worth their cost — the full prize-collecting Steiner tree build, in one call. Returns
-    the final module as an nx.Graph, each edge carrying its cost."""
-    all_terms = protein_terms | metab_terms
-    raw_tree = terminal_steiner_tree(cost_nodes, cost_idx, A_cost, list(all_terms))
-    return _prune_module(raw_tree, all_terms, prize, strictness)
+def build_bridge_module(cost_nodes, cost_idx, A_cost, protein_anchors, metab_anchors, prize, strictness=1.0):
+    """Force every anchor gene in via the cheapest possible connecting tree, then prune away the
+    branches that weren't worth their cost — the full prize-collecting build, in one call.
+    Returns the final module as an nx.Graph, each edge carrying its cost."""
+    all_anchors = protein_anchors | metab_anchors
+    raw_tree = connect_anchor_genes(cost_nodes, cost_idx, A_cost, list(all_anchors))
+    return _prune_module(raw_tree, all_anchors, prize, strictness)
 
 
 def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
@@ -244,23 +245,23 @@ def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
     return sample
 
 
-def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, protein_terminals, metab_terminals,
+def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, protein_anchors, metab_anchors,
                             observed_cost, n_permutations=100, strictness=1.0, seed=0):
     """Null-model validation (Menche et al. 2015 style): rebuild the same prize-collecting bridge
-    module `n_permutations` times from degree-matched random terminal sets the same sizes as the
-    real ones, and compare the real module's total cost to that null distribution. A genuine,
-    specific mechanism should be cheaper to connect (fewer hops, lower-degree interactions) than
-    an arbitrary same-size gene set — so a negative z-score is the result you're hoping for.
-    Returns (null_costs, z_score, p_value)."""
+    module `n_permutations` times from degree-matched random gene sets the same sizes as the
+    real protein and metabolite anchors, and compare the real module's total cost to that null
+    distribution. A genuine, specific mechanism should be cheaper to connect (fewer hops,
+    less-generic interactions) than an arbitrary same-size gene set — so a negative z-score is
+    the result you're hoping for. Returns (null_costs, z_score, p_value)."""
     rng = np.random.default_rng(seed)
     null_costs = []
     t0 = time.time()
     for _ in range(n_permutations):
-        rand_proteins = degree_matched_sample(G, protein_terminals, rng)
-        rand_metabs = degree_matched_sample(G, metab_terminals, rng)
-        rand_terms = rand_proteins | rand_metabs
+        rand_proteins = degree_matched_sample(G, protein_anchors, rng)
+        rand_metabs = degree_matched_sample(G, metab_anchors, rng)
+        rand_anchors = rand_proteins | rand_metabs
         rand_tree = build_bridge_module(cost_nodes, cost_idx, A_cost, rand_proteins, rand_metabs,
-                                         prize={n: 1.0 for n in rand_terms}, strictness=strictness)
+                                         prize={n: 1.0 for n in rand_anchors}, strictness=strictness)
         null_costs.append(sum(d["cost"] for _, _, d in rand_tree.edges(data=True)))
     print(f"{n_permutations} permutations in {time.time() - t0:.0f}s")
 
@@ -438,7 +439,7 @@ def plot_layered_bridge(
     plt.show()
 
 
-def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, metab_terminal_gene,
+def plot_bridge_flowchart(bridge_tree, protein_anchors, bridge_module_nodes, metab_anchor_gene,
                            metabs_matched, id_to_symbol, sym_lookup,
                            max_hop_cap=3, explosion_threshold=70, save_path=None):
     """Everything Step 6 needs beyond its two tunable parameters: hop-tier the connector genes by
@@ -451,7 +452,7 @@ def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, m
         figure automatically falls back to fewer hops.
     """
     hop_from_protein = nx.multi_source_dijkstra_path_length(
-        bridge_tree, protein_terminals & bridge_module_nodes, weight=lambda u, v, d: 1
+        bridge_tree, protein_anchors & bridge_module_nodes, weight=lambda u, v, d: 1
     )
 
     max_hop = max_hop_cap
@@ -465,14 +466,14 @@ def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, m
     hop_tiers = [{n for n, h in hop_from_protein.items() if h == hop} for hop in range(1, max_hop + 1)]
 
     # Only show a metabolite if its own bridging gene survived pruning and lies within the hop cap.
-    shown_metab_ids = {cid for cid, gene in metab_terminal_gene.items()
+    shown_metab_ids = {cid for cid, gene in metab_anchor_gene.items()
                         if gene in bridge_module_nodes and hop_from_protein.get(gene, 999) <= max_hop}
-    n_excluded = len(metab_terminal_gene) - len(shown_metab_ids)
+    n_excluded = len(metab_anchor_gene) - len(shown_metab_ids)
     if n_excluded:
         print(f"{n_excluded} metabolite(s) not pictured -- their bridge lies beyond {max_hop} hop(s) "
               f"from the protein module, or was pruned in Step 3.")
 
-    bottom_nodes = protein_terminals & bridge_module_nodes
+    bottom_nodes = protein_anchors & bridge_module_nodes
     top_nodes = shown_metab_ids
     layout_tiers = [bottom_nodes] + hop_tiers + [top_nodes]
     visible_nodes = bottom_nodes | (set().union(*hop_tiers) if hop_tiers else set())
@@ -482,7 +483,7 @@ def plot_bridge_flowchart(bridge_tree, protein_terminals, bridge_module_nodes, m
         viz_graph.add_nodes_from(tier)
     viz_graph.add_edges_from((u, v) for u, v in bridge_tree.edges() if u in visible_nodes and v in visible_nodes)
     for cid in top_nodes:
-        viz_graph.add_edge(cid, metab_terminal_gene[cid])
+        viz_graph.add_edge(cid, metab_anchor_gene[cid])
 
     kegg_to_name = dict(zip(metabs_matched["kegg_id"], metabs_matched["matched_name"]))
     gene_label_lookup = {**id_to_symbol, **sym_lookup}
