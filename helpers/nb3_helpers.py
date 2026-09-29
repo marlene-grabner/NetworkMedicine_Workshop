@@ -177,14 +177,14 @@ def connect_anchor_genes(nodes, node_idx, A, anchor_genes):
     return tree
 
 
-def select_metabolite_anchors(cost_nodes, cost_idx, A_cost, protein_anchors, metab_to_genes):
+def select_metabolite_anchors(cost_nodes, cost_idx, A_cost, gene_anchors, metab_to_genes):
     """One anchor gene per metabolite: whichever of its candidate bridging genes is cheapest to
-    reach from the protein module — lowest degree-penalized cost, not just fewest hops.
-    Returns (metab_anchor_gene, metab_anchors): a {kegg_id: gene} map, and the set of its
-    (deduplicated) values."""
+    reach from your gene-side anchors (protein module genes, transcript module genes, or both) —
+    lowest degree-penalized cost, not just fewest hops. Returns (metab_anchor_gene, metab_anchors):
+    a {kegg_id: gene} map, and the set of its (deduplicated) values."""
     dist_from_module = dijkstra(
         csgraph=A_cost, directed=False,
-        indices=[cost_idx[n] for n in protein_anchors], min_only=True,
+        indices=[cost_idx[n] for n in gene_anchors], min_only=True,
     )
     metab_anchor_gene = {
         cid: min(genes_here, key=lambda g: dist_from_module[cost_idx[g]])
@@ -214,13 +214,15 @@ def _prune_module(tree, anchor_genes, prize, strictness):
     return tree
 
 
-def build_bridge_module(cost_nodes, cost_idx, A_cost, protein_anchors, metab_anchors, prize, strictness=1.0):
+def build_bridge_module(cost_nodes, cost_idx, A_cost, anchor_genes, prize, strictness=1.0):
     """Force every anchor gene in via the cheapest possible connecting tree, then prune away the
     branches that weren't worth their cost — the full prize-collecting build, in one call.
-    Returns the final module as an nx.Graph, each edge carrying its cost."""
-    all_anchors = protein_anchors | metab_anchors
-    raw_tree = connect_anchor_genes(cost_nodes, cost_idx, A_cost, list(all_anchors))
-    return _prune_module(raw_tree, all_anchors, prize, strictness)
+    `anchor_genes` is the full set you want connected, already unioned across however many
+    anchor groups you have (protein module, transcript module, metabolite entry points, ...) —
+    this function doesn't need to know where they came from. Returns the final module as an
+    nx.Graph, each edge carrying its cost."""
+    raw_tree = connect_anchor_genes(cost_nodes, cost_idx, A_cost, list(anchor_genes))
+    return _prune_module(raw_tree, anchor_genes, prize, strictness)
 
 
 def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
@@ -245,22 +247,24 @@ def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
     return sample
 
 
-def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, protein_anchors, metab_anchors,
+def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, anchor_groups,
                             observed_cost, n_permutations=100, strictness=1.0, seed=0):
     """Null-model validation (Menche et al. 2015 style): rebuild the same prize-collecting bridge
-    module `n_permutations` times from degree-matched random gene sets the same sizes as the
-    real protein and metabolite anchors, and compare the real module's total cost to that null
-    distribution. A genuine, specific mechanism should be cheaper to connect (fewer hops,
-    less-generic interactions) than an arbitrary same-size gene set — so a negative z-score is
-    the result you're hoping for. Returns (null_costs, z_score, p_value)."""
+    module `n_permutations` times from degree-matched random gene sets, and compare the real
+    module's total cost to that null distribution. `anchor_groups` is a list of your real anchor
+    sets (e.g. [protein_anchors, transcript_anchors, metab_anchors]) — each group gets its own
+    independent degree-matched random replacement, so the null model preserves how many anchors
+    came from each original source, not just the total count. A genuine, specific mechanism
+    should be cheaper to connect (fewer hops, less-generic interactions) than an arbitrary
+    same-size gene set — so a negative z-score is the result you're hoping for.
+    Returns (null_costs, z_score, p_value)."""
     rng = np.random.default_rng(seed)
     null_costs = []
     t0 = time.time()
     for _ in range(n_permutations):
-        rand_proteins = degree_matched_sample(G, protein_anchors, rng)
-        rand_metabs = degree_matched_sample(G, metab_anchors, rng)
-        rand_anchors = rand_proteins | rand_metabs
-        rand_tree = build_bridge_module(cost_nodes, cost_idx, A_cost, rand_proteins, rand_metabs,
+        rand_groups = [degree_matched_sample(G, group, rng) for group in anchor_groups]
+        rand_anchors = set().union(*rand_groups)
+        rand_tree = build_bridge_module(cost_nodes, cost_idx, A_cost, rand_anchors,
                                          prize={n: 1.0 for n in rand_anchors}, strictness=strictness)
         null_costs.append(sum(d["cost"] for _, _, d in rand_tree.edges(data=True)))
     print(f"{n_permutations} permutations in {time.time() - t0:.0f}s")
@@ -439,41 +443,46 @@ def plot_layered_bridge(
     plt.show()
 
 
-def plot_bridge_flowchart(bridge_tree, protein_anchors, bridge_module_nodes, metab_anchor_gene,
+def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, metab_anchor_gene,
                            metabs_matched, id_to_symbol, sym_lookup,
                            max_hop_cap=3, explosion_threshold=70, save_path=None):
     """Everything Step 6 needs beyond its two tunable parameters: hop-tier the connector genes by
-    distance from the protein module within the bridge tree, cap the figure's depth if that would
-    make it unreadably large, attach each shown metabolite to its own bridging gene, then hand
-    off to plot_layered_bridge() for the actual drawing.
+    distance from your gene-side anchors within the bridge tree, cap the figure's depth if that
+    would make it unreadably large, attach each shown metabolite to its own bridging gene, then
+    hand off to plot_layered_bridge() for the actual drawing.
 
+    gene_base_groups: (label, color, node_set) tuples for the left-hand base column -- one entry
+        per original anchor source (e.g. protein module, transcript module), each kept in its own
+        color; a node in more than one group should already be split into its own "both" group
+        before calling this, since the node sets here must not overlap.
     max_hop_cap: draw at most this many hop-tiers ("direct" = 1, "one in-between hop" = 2, ...).
     explosion_threshold: total connector genes allowed across all drawn hop-tiers before the
         figure automatically falls back to fewer hops.
     """
-    hop_from_protein = nx.multi_source_dijkstra_path_length(
-        bridge_tree, protein_anchors & bridge_module_nodes, weight=lambda u, v, d: 1
+    gene_anchors = set().union(*(nodes for _, _, nodes in gene_base_groups))
+    hop_from_base = nx.multi_source_dijkstra_path_length(
+        bridge_tree, gene_anchors & bridge_module_nodes, weight=lambda u, v, d: 1
     )
 
     max_hop = max_hop_cap
-    while max_hop > 1 and sum(1 for h in hop_from_protein.values() if 1 <= h <= max_hop) > explosion_threshold:
+    while max_hop > 1 and sum(1 for h in hop_from_base.values() if 1 <= h <= max_hop) > explosion_threshold:
         max_hop -= 1
     if max_hop < max_hop_cap:
-        n_at_full_depth = sum(1 for h in hop_from_protein.values() if 1 <= h <= max_hop_cap)
-        print(f"Capping the figure at {max_hop} hop(s) from the protein module to keep it readable "
+        n_at_full_depth = sum(1 for h in hop_from_base.values() if 1 <= h <= max_hop_cap)
+        print(f"Capping the figure at {max_hop} hop(s) from your gene anchors to keep it readable "
               f"({n_at_full_depth} connector genes would appear at up to {max_hop_cap} hops).")
 
-    hop_tiers = [{n for n, h in hop_from_protein.items() if h == hop} for hop in range(1, max_hop + 1)]
+    hop_tiers = [{n for n, h in hop_from_base.items() if h == hop} for hop in range(1, max_hop + 1)]
 
     # Only show a metabolite if its own bridging gene survived pruning and lies within the hop cap.
     shown_metab_ids = {cid for cid, gene in metab_anchor_gene.items()
-                        if gene in bridge_module_nodes and hop_from_protein.get(gene, 999) <= max_hop}
+                        if gene in bridge_module_nodes and hop_from_base.get(gene, 999) <= max_hop}
     n_excluded = len(metab_anchor_gene) - len(shown_metab_ids)
     if n_excluded:
         print(f"{n_excluded} metabolite(s) not pictured -- their bridge lies beyond {max_hop} hop(s) "
-              f"from the protein module, or was pruned in Step 3.")
+              f"from your gene anchors, or was pruned in Step 3.")
 
-    bottom_nodes = protein_anchors & bridge_module_nodes
+    bottom_nodes = gene_anchors & bridge_module_nodes
     top_nodes = shown_metab_ids
     layout_tiers = [bottom_nodes] + hop_tiers + [top_nodes]
     visible_nodes = bottom_nodes | (set().union(*hop_tiers) if hop_tiers else set())
@@ -494,17 +503,18 @@ def plot_bridge_flowchart(bridge_tree, protein_anchors, bridge_module_nodes, met
     labels.update({n: gene_label_lookup.get(n, n) for n in visible_nodes})
 
     middle_colors = ["#8172B2", "#B3A9D9", "#DCD6EF"][:max_hop]
-    style_groups = [(bottom_nodes, "#4C72B0", "o", 200)]
+    style_groups = [(nodes & bridge_module_nodes, color, "o", 200) for _, color, nodes in gene_base_groups]
     style_groups += [(tier, color, "o", 220) for tier, color in zip(hop_tiers, middle_colors)]
     style_groups.append((top_nodes, "#55A868", "s", 200))
 
-    tier_labels = [("Proteins", "#4C72B0")]
+    tier_labels = [("Your genes", "#666666")]
     tier_labels += [(f"{h} hop{'s' if h > 1 else ''}", color)
                      for h, color in zip(range(1, max_hop + 1), middle_colors)]
     tier_labels.append(("Metabolites", "#55A868"))
 
-    legend_entries = [
-        ("Gene (protein or connector)", "#888888", "o", 9),
+    legend_entries = [(label, color, "o", 9) for label, color, _ in gene_base_groups]
+    legend_entries += [
+        ("Connector gene", "#8172B2", "o", 9),
         ("Metabolite", "#888888", "s", 9),
     ]
 
