@@ -443,18 +443,22 @@ def plot_layered_bridge(
     plt.show()
 
 
-def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, metab_anchor_gene,
+def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, metab_anchor_sources,
                            metabs_matched, id_to_symbol, sym_lookup,
                            max_hop_cap=3, explosion_threshold=70, save_path=None):
     """Everything Step 6 needs beyond its two tunable parameters: hop-tier the connector genes by
     distance from your gene-side anchors within the bridge tree, cap the figure's depth if that
-    would make it unreadably large, attach each shown metabolite to its own bridging gene, then
-    hand off to plot_layered_bridge() for the actual drawing.
+    would make it unreadably large, attach each shown metabolite to whichever of its bridging
+    genes survived, then hand off to plot_layered_bridge() for the actual drawing.
 
     gene_base_groups: (label, color, node_set) tuples for the left-hand base column -- one entry
         per original anchor source (e.g. protein module, transcript module), each kept in its own
         color; a node in more than one group should already be split into its own "both" group
         before calling this, since the node sets here must not overlap.
+    metab_anchor_sources: (label, {kegg_id: gene}) pairs -- one per layer a metabolite can bridge
+        into (e.g. [("protein", metab_anchor_gene_protein), ("transcript", metab_anchor_gene_transcript)]).
+        A metabolite can end up with one edge, two (if both bridges survived pruning, possibly
+        through the same gene or different ones), or none.
     max_hop_cap: draw at most this many hop-tiers ("direct" = 1, "one in-between hop" = 2, ...).
     explosion_threshold: total connector genes allowed across all drawn hop-tiers before the
         figure automatically falls back to fewer hops.
@@ -474,13 +478,16 @@ def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, me
 
     hop_tiers = [{n for n, h in hop_from_base.items() if h == hop} for hop in range(1, max_hop + 1)]
 
-    # Only show a metabolite if its own bridging gene survived pruning and lies within the hop cap.
-    shown_metab_ids = {cid for cid, gene in metab_anchor_gene.items()
-                        if gene in bridge_module_nodes and hop_from_base.get(gene, 999) <= max_hop}
-    n_excluded = len(metab_anchor_gene) - len(shown_metab_ids)
+    # Every (metabolite, bridging gene) pair across every layer -- a metabolite can appear more
+    # than once here if it bridges into more than one layer, through the same gene or different ones.
+    all_links = {(cid, gene) for _, mapping in metab_anchor_sources for cid, gene in mapping.items()}
+    shown_links = {(cid, gene) for cid, gene in all_links
+                   if gene in bridge_module_nodes and hop_from_base.get(gene, 999) <= max_hop}
+    shown_metab_ids = {cid for cid, gene in shown_links}
+    n_excluded = len(all_links) - len(shown_links)
     if n_excluded:
-        print(f"{n_excluded} metabolite(s) not pictured -- their bridge lies beyond {max_hop} hop(s) "
-              f"from your gene anchors, or was pruned in Step 3.")
+        print(f"{n_excluded} metabolite bridge(s) not pictured -- they lie beyond {max_hop} hop(s) "
+              f"from your gene anchors, or were pruned in Step 3.")
 
     bottom_nodes = gene_anchors & bridge_module_nodes
     top_nodes = shown_metab_ids
@@ -491,8 +498,8 @@ def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, me
     for tier in layout_tiers:
         viz_graph.add_nodes_from(tier)
     viz_graph.add_edges_from((u, v) for u, v in bridge_tree.edges() if u in visible_nodes and v in visible_nodes)
-    for cid in top_nodes:
-        viz_graph.add_edge(cid, metab_anchor_gene[cid])
+    for cid, gene in shown_links:
+        viz_graph.add_edge(cid, gene)
 
     kegg_to_name = dict(zip(metabs_matched["kegg_id"], metabs_matched["matched_name"]))
     gene_label_lookup = {**id_to_symbol, **sym_lookup}
