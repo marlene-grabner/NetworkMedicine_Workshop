@@ -444,12 +444,13 @@ def plot_layered_bridge(
 
 
 def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, metab_anchor_sources,
-                           metabs_matched, id_to_symbol, sym_lookup,
+                           metabolite_graph, metabs_matched, id_to_symbol, sym_lookup,
                            max_hop_cap=3, explosion_threshold=70, save_path=None):
     """Everything Step 6 needs beyond its two tunable parameters: hop-tier the connector genes by
     distance from your gene-side anchors within the bridge tree, cap the figure's depth if that
     would make it unreadably large, attach each shown metabolite to whichever of its bridging
-    genes survived, then hand off to plot_layered_bridge() for the actual drawing.
+    genes survived (plus any real metabolite-metabolite edges between shown metabolites), then
+    hand off to plot_layered_bridge() for the actual drawing.
 
     gene_base_groups: (label, color, node_set) tuples for the left-hand base column -- one entry
         per original anchor source (e.g. protein module, transcript module), each kept in its own
@@ -459,6 +460,8 @@ def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, me
         into (e.g. [("protein", metab_anchor_gene_protein), ("transcript", metab_anchor_gene_transcript)]).
         A metabolite can end up with one edge, two (if both bridges survived pruning, possibly
         through the same gene or different ones), or none.
+    metabolite_graph: the metabolite-metabolite network (graphs["metabolite"]) -- real edges
+        between shown metabolites are drawn too, not just their bridges into gene space.
     max_hop_cap: draw at most this many hop-tiers ("direct" = 1, "one in-between hop" = 2, ...).
     explosion_threshold: total connector genes allowed across all drawn hop-tiers before the
         figure automatically falls back to fewer hops.
@@ -500,6 +503,7 @@ def plot_bridge_flowchart(bridge_tree, gene_base_groups, bridge_module_nodes, me
     viz_graph.add_edges_from((u, v) for u, v in bridge_tree.edges() if u in visible_nodes and v in visible_nodes)
     for cid, gene in shown_links:
         viz_graph.add_edge(cid, gene)
+    viz_graph.add_edges_from(metabolite_graph.subgraph(top_nodes).edges())
 
     kegg_to_name = dict(zip(metabs_matched["kegg_id"], metabs_matched["matched_name"]))
     gene_label_lookup = {**id_to_symbol, **sym_lookup}
