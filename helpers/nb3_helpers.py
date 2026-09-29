@@ -42,13 +42,23 @@ def load_gene_symbol_lookup(lookups_dir):
     return dict(zip(df["ncbi_gene_id"], df["symbol"]))
 
 
-def load_cached_enrichment(lookups_dir, cache_key):
+def load_cached_enrichment(lookups_dir, cache_key, genes=None):
     """A precomputed g:Profiler enrichment table for one of this notebook's two default queries
     (see lookups/<cache_key>.csv, built once from the workshop's own synthetic data). Returns
-    None if that file isn't there, so the caller can fall back to a live g:Profiler call."""
+    None if that file isn't there, so the caller can fall back to a live g:Profiler call.
+    If `genes` is given, the cached table is only used when lookups/<cache_key>_genes.txt lists
+    exactly that gene set -- so a cache built for a different bridge module is never mistaken
+    for this one's."""
     path = os.path.join(lookups_dir, f"{cache_key}.csv")
     if not os.path.exists(path):
         return None
+    if genes is not None:
+        genes_path = os.path.join(lookups_dir, f"{cache_key}_genes.txt")
+        if not os.path.exists(genes_path):
+            return None
+        with open(genes_path) as f:
+            if {line.strip() for line in f if line.strip()} != set(genes):
+                return None
     import pandas as pd
     return pd.read_csv(path)
 
@@ -140,6 +150,59 @@ def build_cost_graph(G):
     return nodes, node_idx, A, degrees
 
 
+def build_multilayer_graph(ppi, transcriptome, metabolite, bridge_links, metabolite_nodes):
+    """One graph with three separate layers -- every node is a (layer, id) tuple, so the same
+    gene in the PPI network and in the co-expression network is two different nodes,
+    ("protein", g) and ("transcript", g), and nothing connects them directly. The only way to get
+    from the protein layer to the transcript layer is through a metabolite:
+
+      * protein-protein / transcript-transcript / metabolite-metabolite edges come from each
+        layer's own network, priced by sqrt(deg(u) * deg(v)) using that layer's own degrees;
+      * metabolite-gene edges come from `bridge_links` ((kegg_id, gene) pairs from the KEGG
+        bridge). A metabolite links independently into whichever layers its gene sits in, at the
+        same price -- sqrt(number of genes on the metabolite * number of metabolites on the gene).
+
+    Within each edge family, costs are divided by that family's median, so a typical edge costs
+    about 1 no matter which network it came from. Only the metabolites in `metabolite_nodes`
+    are part of the graph. Returns (nodes, node_idx, A, H): the node list, its index map, the
+    sparse cost matrix for Dijkstra, and the same graph as an nx.Graph with edge attribute "cost"."""
+    H = nx.Graph()
+
+    def add_family(edges, deg, node_of):
+        raw = {(u, v): np.sqrt(deg[u] * deg[v]) for u, v in edges}
+        median = np.median(list(raw.values())) if raw else 1.0
+        for (u, v), c in raw.items():
+            H.add_edge(node_of(u), node_of(v), cost=c / median)
+
+    add_family(list(ppi.edges()), dict(ppi.degree()), lambda g: ("protein", g))
+    add_family(list(transcriptome.edges()), dict(transcriptome.degree()), lambda g: ("transcript", g))
+    keep = set(metabolite_nodes)
+    add_family([(u, v) for u, v in metabolite.edges() if u in keep and v in keep],
+               dict(metabolite.degree()), lambda c: ("metabolite", c))
+
+    links = {(c, g) for c, g in bridge_links if c in keep}
+    n_genes_per_metab, n_metabs_per_gene = {}, {}
+    for c, g in links:
+        n_genes_per_metab[c] = n_genes_per_metab.get(c, 0) + 1
+        n_metabs_per_gene[g] = n_metabs_per_gene.get(g, 0) + 1
+    raw = {(c, g): np.sqrt(n_genes_per_metab[c] * n_metabs_per_gene[g]) for c, g in links}
+    median = np.median(list(raw.values())) if raw else 1.0
+    for (c, g), r in raw.items():
+        for layer, G in (("protein", ppi), ("transcript", transcriptome)):
+            if g in G:
+                H.add_edge(("metabolite", c), (layer, g), cost=r / median)
+
+    nodes = list(H.nodes())
+    node_idx = {n: i for i, n in enumerate(nodes)}
+    rows, cols, data = [], [], []
+    for u, v, d in H.edges(data=True):
+        rows += [node_idx[u], node_idx[v]]
+        cols += [node_idx[v], node_idx[u]]
+        data += [d["cost"], d["cost"]]
+    A = csr_matrix((data, (rows, cols)), shape=(len(nodes), len(nodes)))
+    return nodes, node_idx, A, H
+
+
 def connect_anchor_genes(nodes, node_idx, A, anchor_genes):
     """The cheapest possible tree connecting every gene in `anchor_genes` through the (weighted)
     network behind A: work out the cheapest path between every pair of anchor genes, keep only
@@ -225,11 +288,50 @@ def build_bridge_module(cost_nodes, cost_idx, A_cost, anchor_genes, prize, stric
     return _prune_module(raw_tree, anchor_genes, prize, strictness)
 
 
-def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
+def add_layer_links(tree, H, max_cost):
+    """Give every metabolite in the bridge module a link into *each* gene layer, not just the one
+    the cheapest tree happened to need. A Steiner tree only pays for the connections that are
+    strictly needed to reach every anchor, so once (say) the protein layer is attached through
+    one metabolite it adds nothing more -- extra links cost without collecting any prize. That
+    leaves a module held together by a single metabolite-gene edge per layer.
+
+    Here, for every metabolite that has no neighbor in a layer yet, we add the cheapest route from
+    it to the nearest node of that layer already in the module -- travelling only through nodes
+    that are not yet in the module, so it can only ever add a fresh branch -- provided that route
+    costs at most `max_cost` (same idea as the prize-collecting cutoff: not worth it if too
+    expensive). The result is no longer a strict tree: these links deliberately create cycles,
+    which is the redundancy we're after. Returns (module, added) where `added` lists the
+    (metabolite, layer, cost) links that were added."""
+    module = tree.copy()
+    added = []
+    for layer in ("protein", "transcript"):
+        for node in sorted(n for n in tree.nodes() if n[0] == "metabolite"):
+            if any(nb[0] == layer for nb in module.neighbors(node)):
+                continue
+            targets = {n for n in module if n[0] == layer}
+            blocked = set(module.nodes()) - targets - {node}   # already in the module: don't route through
+            dist, paths = nx.single_source_dijkstra(
+                H, node, cutoff=max_cost,
+                weight=lambda u, v, d: None if (u in blocked or v in blocked) else d["cost"],
+            )
+            reachable = [t for t in targets if t in dist]
+            if not reachable:
+                continue
+            best = min(reachable, key=lambda t: dist[t])
+            for a, b in zip(paths[best][:-1], paths[best][1:]):
+                module.add_edge(a, b, cost=H.edges[a, b]["cost"])
+            added.append((node[1], layer, dist[best]))
+    return module, added
+
+
+def degree_matched_sample(G, seed_nodes, rng, n_bins=10, candidates=None):
     """Draw a random node set the same size as seed_nodes, matched bin-for-bin on degree — the
     same idea as Notebook 4's null model, used here to ask whether a same-size, similarly-
-    connected random set of genes would build as cheap a bridge module as the real one does."""
-    degrees = dict(G.degree())
+    connected random set of nodes would build as cheap a bridge module as the real one does.
+    `candidates` restricts both the degree bins and the draw to a subset of G's nodes (e.g. only
+    the protein-layer nodes), so a random "protein anchor" is always a protein-layer node."""
+    pool_nodes = list(candidates) if candidates is not None else list(G.nodes())
+    degrees = {n: G.degree(n) for n in pool_nodes}
     deg_values = np.array(list(degrees.values()))
     edges = np.unique(np.quantile(deg_values, np.linspace(0, 1, n_bins + 1)))
     nodes_in_bin = {i: [] for i in range(len(edges) - 1)}
@@ -240,15 +342,17 @@ def degree_matched_sample(G, seed_nodes, rng, n_bins=10):
     seed_set = set(seed_nodes)
     sample = set()
     for n in seed_nodes:
-        d = degrees[n]
-        b = min(np.searchsorted(edges, d, side="right") - 1, len(edges) - 2)
+        d = G.degree(n)
+        b = min(max(np.searchsorted(edges, d, side="right") - 1, 0), len(edges) - 2)
         pool = [x for x in nodes_in_bin[b] if x not in seed_set and x not in sample]
-        sample.add(rng.choice(pool) if pool else rng.choice(list(G.nodes())))
+        chosen_from = pool if pool else pool_nodes   # index, not rng.choice(list): nodes may be tuples
+        sample.add(chosen_from[rng.integers(len(chosen_from))])
     return sample
 
 
 def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, anchor_groups,
-                            observed_cost, n_permutations=100, strictness=1.0, seed=0):
+                            observed_cost, n_permutations=100, strictness=1.0, seed=0,
+                            group_candidates=None):
     """Null-model validation (Menche et al. 2015 style): rebuild the same prize-collecting bridge
     module `n_permutations` times from degree-matched random gene sets, and compare the real
     module's total cost to that null distribution. `anchor_groups` is a list of your real anchor
@@ -257,12 +361,15 @@ def validate_bridge_module(G, cost_nodes, cost_idx, A_cost, anchor_groups,
     came from each original source, not just the total count. A genuine, specific mechanism
     should be cheaper to connect (fewer hops, less-generic interactions) than an arbitrary
     same-size gene set — so a negative z-score is the result you're hoping for.
-    Returns (null_costs, z_score, p_value)."""
+    `group_candidates`, if given, is a list (one entry per anchor group) of the nodes that group
+    may be redrawn from -- in the three-layer graph, e.g. only protein-layer nodes for the protein
+    anchors. Returns (null_costs, z_score, p_value)."""
     rng = np.random.default_rng(seed)
     null_costs = []
     t0 = time.time()
     for _ in range(n_permutations):
-        rand_groups = [degree_matched_sample(G, group, rng) for group in anchor_groups]
+        rand_groups = [degree_matched_sample(G, group, rng, candidates=(group_candidates[i] if group_candidates else None))
+                       for i, group in enumerate(anchor_groups)]
         rand_anchors = set().union(*rand_groups)
         rand_tree = build_bridge_module(cost_nodes, cost_idx, A_cost, rand_anchors,
                                          prize={n: 1.0 for n in rand_anchors}, strictness=strictness)
@@ -440,6 +547,92 @@ def plot_layered_bridge(
     ax.set_title(title, pad=14, fontsize=13)
     ax.axis("off")
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.show()
+
+
+def plot_three_layer_bridge(bridge_tree, protein_anchors, transcript_anchors, metabolite_graph,
+                            metabs_matched, gene_labels, save_path=None):
+    """Draw the three-layer bridge module as three columns -- protein layer on the left,
+    metabolites in the middle, transcript layer on the right -- with the metabolite-gene links
+    running between them. There is no protein-transcript line anywhere: the only way across is
+    through a metabolite. Within a column, nodes are ordered by walking along the module's
+    branches so connected nodes end up next to each other, and edges within a layer are drawn as
+    arcs. Circles with a dark outline are your DE anchors, small squares are connector nodes the
+    tree needed to hold it together. Real metabolite-metabolite edges among the shown metabolites
+    are drawn too, as in the export.
+
+    bridge_tree: nx.Graph whose nodes are (layer, id) tuples, as returned by build_bridge_module
+        on the three-layer graph.
+    gene_labels: {gene_id: display name}; metabolites are labeled from metabs_matched."""
+    from matplotlib.patches import FancyArrowPatch
+    kegg_to_name = dict(zip(metabs_matched["kegg_id"], metabs_matched["matched_name"]))
+    layers = ["protein", "metabolite", "transcript"]
+    colors = {"protein": "#2166AC", "metabolite": "#B2182B", "transcript": "#1B7837"}
+    x_col = {"protein": 0.0, "metabolite": 9.0, "transcript": 18.0}
+    label_side = {"protein": (-0.35, "right"), "metabolite": (0.35, "left"), "transcript": (0.35, "left")}
+    anchors = {"protein": set(protein_anchors), "transcript": set(transcript_anchors)}
+
+    G = nx.Graph(bridge_tree)
+    metab_here = [n for n in G if n[0] == "metabolite"]
+    G.add_edges_from((("metabolite", u), ("metabolite", v))
+                     for u, v in metabolite_graph.subgraph([n for _, n in metab_here]).edges())
+
+    # One column per layer: walk each connected piece of that layer depth-first (largest piece
+    # first, starting from its best-connected node) so neighbors are listed next to each other.
+    max_rows = 1
+    order = {}
+    for layer in layers:
+        sub = G.subgraph([n for n in G if n[0] == layer])
+        rows = []
+        for comp in sorted(nx.connected_components(sub), key=len, reverse=True):
+            start = max(comp, key=lambda n: (sub.degree(n), n))
+            rows += list(nx.dfs_preorder_nodes(sub.subgraph(comp), source=start))
+        order[layer] = rows
+        max_rows = max(max_rows, len(rows))
+    pos = {}
+    for layer in layers:
+        n = len(order[layer])
+        for i, node in enumerate(order[layer]):
+            pos[node] = (x_col[layer], -(i + 0.5) * max_rows / n)   # every column spans the same height
+
+    fig, ax = plt.subplots(figsize=(15, max(9, 0.22 * max_rows)))
+    for u, v in G.edges():
+        cross = u[0] != v[0]
+        gap = abs(pos[u][1] - pos[v][1])
+        ax.add_patch(FancyArrowPatch(
+            pos[u], pos[v], arrowstyle="-", mutation_scale=1,
+            connectionstyle="arc3,rad=0" if (cross or gap < 1.6 * max_rows / max(len(order[u[0]]), 1))
+            else "arc3,rad=0.25",
+            color="#D98A00" if cross else "#888888", alpha=0.75 if cross else 0.5,
+            lw=1.5 if cross else 0.7, zorder=1,
+        ))
+    for layer in layers:
+        nodes = order[layer]
+        is_anchor = {n for n in nodes if layer == "metabolite" or n[1] in anchors[layer]}
+        for group, marker, size, alpha, edge in (
+            ([n for n in nodes if n not in is_anchor], "s", 35, 0.55, "none"),
+            ([n for n in nodes if n in is_anchor], "o", 90, 1.0, "black"),
+        ):
+            if group:
+                ax.scatter([pos[n][0] for n in group], [pos[n][1] for n in group], s=size, marker=marker,
+                           c=colors[layer], alpha=alpha, edgecolors=edge, linewidths=0.8, zorder=3)
+        dx, ha = label_side[layer]
+        for n in nodes:
+            name = kegg_to_name.get(n[1], n[1]) if layer == "metabolite" else gene_labels.get(n[1], n[1])
+            ax.text(pos[n][0] + dx, pos[n][1], name, fontsize=6.5, ha=ha, va="center", zorder=4)
+        ax.text(x_col[layer], 1.5, f"{layer.capitalize()} layer ({len(nodes)})", ha="center",
+                fontsize=13, fontweight="bold", color=colors[layer])
+    ax.legend(handles=[
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#999999", markeredgecolor="black", markersize=9, label="Your DE anchor"),
+        plt.Line2D([0], [0], marker="s", color="w", markerfacecolor="#999999", markersize=6, label="Connector node"),
+        plt.Line2D([0], [0], color="#D98A00", lw=2, label="Metabolite-gene link (between layers)"),
+    ], loc="lower center", bbox_to_anchor=(0.5, -0.04), ncol=3, frameon=False)
+    ax.set_xlim(-5, 23)
+    ax.set_ylim(-max_rows - 1, 3)
+    ax.set_title("Cross-omics bridge module: three layers, connected only through metabolites", fontsize=13, pad=14)
+    ax.axis("off")
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.show()
 
 
